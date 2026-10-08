@@ -361,7 +361,25 @@
   font-size: 0.75rem;
 }
 
-/* Manual Score Override Modal */
+/* Manual Score Override & Import Modals */
+.modal-backdrop,
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  inset: 0;
+  background-color: rgba(0, 0, 0, 0.65);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 1.5rem;
+  backdrop-filter: blur(4px);
+}
+
+.modal-content,
 .override-modal-content {
   background-color: var(--bg-card);
   border: 1px solid var(--border-subtle);
@@ -370,12 +388,25 @@
   width: 100%;
   padding: 2rem;
   box-shadow: var(--shadow-lg);
+  position: relative;
+  max-height: 90vh;
+  overflow-y: auto;
 }
 
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1.5rem;
+}
+
+.form-group,
 .override-form-group {
   margin-bottom: 1.25rem;
 }
 
+.form-group label,
+.form-label,
 .override-form-group label {
   display: block;
   font-size: 0.8125rem;
@@ -384,9 +415,11 @@
   margin-bottom: 0.4rem;
 }
 
+.modal-actions,
 .override-actions {
   display: flex;
   justify-content: flex-end;
   gap: 0.75rem;
   margin-top: 1.5rem;
 }
+

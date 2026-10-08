@@ -386,6 +386,32 @@ describe('SocketHandler Unit Tests', () => {
     assert.equal(pending[0].submitted_answer, 'Cascaded Style Sheet');
   });
 
+  it('10b. Obviously far-off Identification answer (e.g. "yes") is auto-failed and NEVER sent to judge queue', () => {
+    const q2 = dbMod.getQuestion(2); // "Cascading Style Sheets"
+    engine.stageQuestion(q2);
+    engine.startCountdown(30);
+
+    const client = new MockSocket('client_far_off');
+    io.connectSocket(client);
+    client.emit('contestant:auth', { pin: '1002' }, () => {});
+
+    let ack = null;
+    // 'yes' has 0% similarity to 'Cascading Style Sheets' -> auto-fail, never sent to judge
+    client.emit('contestant:submit', { pin: '1002', questionId: 2, answer: 'yes' }, (res) => {
+      ack = res;
+    });
+
+    assert.ok(ack);
+    assert.equal(ack.success, true);
+    assert.equal(ack.pointsAwarded, 0);
+    assert.equal(ack.judgeStatus, 'AUTO', 'Far-off answer must be auto-graded as AUTO');
+
+    // Only the previous test's pending item should exist; "yes" must NOT be in pending rulings
+    const pending = dbMod.getPendingRulings();
+    const yesDispute = pending.find(p => p.submitted_answer === 'yes');
+    assert.equal(yesDispute, undefined, 'Obviously far-off answer "yes" must NOT enter judge queue');
+  });
+
   it('11. Judge dispute action APPROVED updates submission and awards points dynamically', () => {
     const q2 = dbMod.getQuestion(2);
     engine.stageQuestion(q2);

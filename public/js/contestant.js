@@ -583,9 +583,11 @@
         if (!inputAnswer) return;
         if (inputAnswer.type === 'password') {
           inputAnswer.type = 'text';
+          inputAnswer.classList.remove('is-masked');
           btnPeekAnswer.textContent = '🔒 Hide';
         } else {
           inputAnswer.type = 'password';
+          inputAnswer.classList.add('is-masked');
           btnPeekAnswer.textContent = '👁 Peek';
         }
       });

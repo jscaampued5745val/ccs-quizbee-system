@@ -26,7 +26,7 @@ class SocketHandler {
   constructor(io, gameEngine, db, telemetryManager = null, options = {}) {
     this.io = io;
     this.engine = gameEngine;
-    this.db = db;
+    this.db = (db && typeof db.getContestantByPin === 'function') ? db : require('./db');
 
     // Resolve TelemetryManager instance
     if (telemetryManager instanceof TelemetryManager || (telemetryManager && typeof telemetryManager.ingestIncident === 'function')) {
@@ -35,7 +35,7 @@ class SocketHandler {
     } else {
       const opts = (telemetryManager && typeof telemetryManager === 'object') ? telemetryManager : (options || {});
       this.options = opts;
-      this.telemetryManager = new TelemetryManager({ db, ...opts });
+      this.telemetryManager = new TelemetryManager({ db: this.db, ...opts });
     }
 
     this.graceWindowMs = this.options.graceWindowMs || TIMING?.GRACE_WINDOW_MS || 300;
@@ -267,7 +267,8 @@ class SocketHandler {
         socket.data.role = 'JUDGE';
         socket.data.authenticated = true;
 
-        const pending = typeof this.db.getPendingRulings === 'function' ? this.db.getPendingRulings() : [];
+        const pendingRaw = typeof this.db.getPendingRulings === 'function' ? this.db.getPendingRulings() : [];
+        const pending = this._formatPendingDisputes(pendingRaw);
         const response = {
           success: true,
           gameState: this.engine.getState(),
@@ -281,7 +282,8 @@ class SocketHandler {
       socket.on('judge:queue:get', (payloadOrCallback, maybeCallback) => {
         const callback = typeof maybeCallback === 'function' ? maybeCallback : (typeof payloadOrCallback === 'function' ? payloadOrCallback : () => {});
         if (!this._requireRole(socket, 'JUDGE', callback)) return;
-        const pending = typeof this.db.getPendingRulings === 'function' ? this.db.getPendingRulings() : [];
+        const pendingRaw = typeof this.db.getPendingRulings === 'function' ? this.db.getPendingRulings() : [];
+        const pending = this._formatPendingDisputes(pendingRaw);
         const response = { success: true, items: pending };
         callback(response);
         socket.emit('judge:queue:response', response);
@@ -585,10 +587,19 @@ class SocketHandler {
           awardedPoints = currentQ.points || 2;
           judgeStatus = 'AUTO';
         } else {
-          // Disputed identification answer -> Enter Judge Review Queue
-          isCorrect = 0;
-          awardedPoints = 0;
-          judgeStatus = 'PENDING';
+          // Check similarity: only route plausible candidates (>= 30% match) to Judge review queue
+          const maxSimilarity = this._calculateMaxSimilarity(userClean, correctClean, synonyms);
+          if (maxSimilarity >= 0.30) {
+            // Plausible candidate -> Enter Judge Review Queue
+            isCorrect = 0;
+            awardedPoints = 0;
+            judgeStatus = 'PENDING';
+          } else {
+            // Obvious mismatch or far-off answer -> Auto-fail without cluttering judge queue
+            isCorrect = 0;
+            awardedPoints = 0;
+            judgeStatus = 'AUTO';
+          }
         }
       }
     }
@@ -644,6 +655,11 @@ class SocketHandler {
 
     // 7. Stream dispute to Judge Panel if PENDING
     if (judgeStatus === 'PENDING') {
+      const syns = this._extractSynonyms(currentQ);
+      const userClean = String(rawAnswer || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      const correctClean = String(currentQ.correct_answer || currentQ.correctAnswer || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      const similarityScore = this._calculateMaxSimilarity(userClean, correctClean, syns);
+
       this.io.to('room:judges').emit('judge:dispute:new', {
         submissionId: savedSub ? savedSub.id : null,
         contestantId: contestant.id,
@@ -653,9 +669,10 @@ class SocketHandler {
         questionId: currentQ.id,
         questionText: currentQ.question_text || currentQ.text,
         correctAnswer: currentQ.correct_answer || currentQ.correctAnswer,
-        acceptableSynonyms: this._extractSynonyms(currentQ),
-        synonyms: this._extractSynonyms(currentQ),
+        acceptableSynonyms: syns,
+        synonyms: syns,
         submittedAnswer: rawAnswer,
+        similarity: Math.round(similarityScore * 100),
         maxPoints: currentQ.points || 2,
         serverTimeMs: serverTimestamp,
         status: 'PENDING'
@@ -701,6 +718,111 @@ class SocketHandler {
       return raw.split(';').map(normalize).filter(Boolean);
     }
     return [];
+  }
+
+  /**
+   * Calculate string similarity between two strings (0.0 to 1.0)
+   * Combines Levenshtein distance, substring containment, and word token overlap
+   * @param {string} str1
+   * @param {string} str2
+   * @returns {number}
+   */
+  _calculateSimilarity(str1, str2) {
+    const s1 = String(str1 || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    const s2 = String(str2 || '').trim().toLowerCase().replace(/\s+/g, ' ');
+    if (!s1 || !s2) return 0.0;
+    if (s1 === s2) return 1.0;
+
+    // Substring containment
+    let substringScore = 0.0;
+    if (s1.includes(s2) || s2.includes(s1)) {
+      const minLen = Math.min(s1.length, s2.length);
+      const maxLen = Math.max(s1.length, s2.length);
+      substringScore = minLen / maxLen;
+    }
+
+    // Levenshtein edit distance using rolling buffers
+    const m = s1.length;
+    const n = s2.length;
+    let prev = new Uint8Array(n + 1);
+    let curr = new Uint8Array(n + 1);
+    for (let j = 0; j <= n; j++) prev[j] = j;
+
+    for (let i = 1; i <= m; i++) {
+      curr[0] = i;
+      for (let j = 1; j <= n; j++) {
+        curr[j] = s1[i - 1] === s2[j - 1]
+          ? prev[j - 1]
+          : 1 + Math.min(prev[j], curr[j - 1], prev[j - 1]);
+      }
+      prev.set(curr);
+    }
+
+    const editDistance = prev[n];
+    const maxLen = Math.max(m, n);
+
+    // For short words (<= 3 chars), changing 2 or more characters means a completely different word
+    let levScore = 0.0;
+    if (maxLen <= 3 && editDistance >= 2) {
+      levScore = 0.0;
+    } else {
+      levScore = maxLen === 0 ? 1.0 : Math.max(0.0, 1.0 - (editDistance / maxLen));
+    }
+
+    // Word token overlap (Jaccard similarity on tokens)
+    const words1 = s1.split(/\s+/).filter(Boolean);
+    const words2 = s2.split(/\s+/).filter(Boolean);
+    let wordScore = 0.0;
+    if (words1.length > 0 && words2.length > 0) {
+      const set2 = new Set(words2);
+      const common = words1.filter(w => set2.has(w)).length;
+      const union = new Set([...words1, ...words2]).size;
+      wordScore = union === 0 ? 0 : (common / union);
+    }
+
+    return Math.max(levScore, substringScore, wordScore);
+  }
+
+  /**
+   * Calculate maximum similarity between user input and target/synonyms
+   * @param {string} userClean
+   * @param {string} correctClean
+   * @param {string[]} synonyms
+   * @returns {number}
+   */
+  _calculateMaxSimilarity(userClean, correctClean, synonyms = []) {
+    let max = this._calculateSimilarity(userClean, correctClean);
+    for (const syn of synonyms) {
+      const s = this._calculateSimilarity(userClean, syn);
+      if (s > max) max = s;
+      if (max >= 1.0) break;
+    }
+    return max;
+  }
+
+  /**
+   * Enrich raw database pending rulings with calculated similarity
+   * @param {Array<Object>} rows
+   * @returns {Array<Object>}
+   */
+  _formatPendingDisputes(rows = []) {
+    if (!Array.isArray(rows)) return [];
+    return rows.map((row) => {
+      let syns = [];
+      if (row.acceptable_synonyms_json) {
+        try {
+          const parsed = JSON.parse(row.acceptable_synonyms_json);
+          syns = Array.isArray(parsed) ? parsed : [];
+        } catch (_) {}
+      }
+      const userClean = String(row.submitted_answer || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      const correctClean = String(row.correct_answer || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      const sim = this._calculateMaxSimilarity(userClean, correctClean, syns);
+      return {
+        ...row,
+        similarity: Math.round(sim * 100)
+      };
+    });
   }
 
   // =========================================================================
@@ -848,8 +970,12 @@ class SocketHandler {
         const roundId = payload ? payload.roundId : null;
         const question = typeof this.db.getQuestion === 'function' ? this.db.getQuestion(questionId) : null;
 
-        if (!question && !questionId) {
-          return ack({ success: false, error: 'QUESTION_NOT_FOUND' });
+        // Never stage a stub: if the DB layer is available and the question does not exist,
+        // contestants would receive an empty question (no text/options).
+        if (!questionId || (typeof this.db.getQuestion === 'function' && !question)) {
+          const errRes = { success: false, error: 'QUESTION_NOT_FOUND', message: `Question ${questionId} not found in question bank` };
+          socket.emit('error', errRes);
+          return ack(errRes);
         }
 
         const state = this.engine.stageQuestion(question || questionId, roundId || (question ? question.round_id : 1));
@@ -968,8 +1094,12 @@ class SocketHandler {
         return ack({ success: false, error: 'INVALID_OVERRIDE_PAYLOAD' });
       }
 
-      const pin = String(payload.pin);
+      const pin = String(payload.pin).trim();
       const newScore = Number(payload.newScore);
+      if (isNaN(newScore) || newScore < 0) {
+        return ack({ success: false, error: 'INVALID_OVERRIDE_PAYLOAD' });
+      }
+
       const contestant = typeof this.db.getContestantByPin === 'function'
         ? this.db.getContestantByPin(pin)
         : null;
@@ -979,11 +1109,29 @@ class SocketHandler {
       }
 
       try {
-        const dbInstance = typeof this.db.getDb === 'function' ? this.db.getDb() : null;
-        if (dbInstance) {
-          dbInstance.prepare('UPDATE CONTESTANTS SET total_score = ? WHERE pin = ?').run(newScore, pin);
+        if (typeof this.db.overrideContestantScore === 'function') {
+          this.db.overrideContestantScore(pin, newScore);
+        } else {
+          const dbInstance = typeof this.db.getDb === 'function' ? this.db.getDb() : null;
+          if (dbInstance) {
+            dbInstance.prepare('UPDATE CONTESTANTS SET total_score = ? WHERE pin = ?').run(newScore, pin);
+          }
         }
-        this.telemetryManager.updateScore(pin, newScore);
+
+        if (this.telemetryManager && typeof this.telemetryManager.updateScore === 'function') {
+          this.telemetryManager.updateScore(pin, newScore);
+        }
+
+        // Broadcast live telemetry updates
+        if (this.telemetryManager && typeof this.telemetryManager.getSnapshot === 'function') {
+          this.io.to('room:quizmaster').emit('qm:telemetry:snapshot', this.telemetryManager.getSnapshot());
+        }
+        this.io.to('room:quizmaster').emit('qm:telemetry:update', {
+          pin,
+          terminalNumber: contestant.terminal_number,
+          score: newScore,
+          type: 'SCORE_OVERRIDE'
+        });
 
         // Notify contestant
         this.io.to(`contestant:${pin}`).emit('contestant:score:update', {

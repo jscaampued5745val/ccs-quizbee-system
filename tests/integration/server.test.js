@@ -7,7 +7,17 @@ const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const { io: ClientIO } = require('socket.io-client');
+const path = require('node:path');
+const os = require('node:os');
+const fs = require('node:fs');
+
+// Isolated DB: this suite performs destructive operations (replace-import, score reset),
+// so it must NEVER run against the live tournament quizbee.db.
+const TEST_DB_PATH = path.join(os.tmpdir(), `quizbee_server_test_${process.pid}_${Date.now()}.db`);
+process.env.QUIZBEE_DB_PATH = TEST_DB_PATH;
+
 const { startServer, stopServer, app, server, io, gameEngine, db } = require('../../src/server');
+const { runSeed } = require('../../scripts/seed');
 
 const TEST_PORT = 3199;
 const BASE_URL = `http://127.0.0.1:${TEST_PORT}`;
@@ -78,11 +88,15 @@ function fetchRaw(path) {
 
 describe('Server Integration Tests (src/server.js)', () => {
   before(async () => {
+    runSeed(TEST_DB_PATH);
     await startServer(TEST_PORT);
   });
 
   after(async () => {
     await stopServer();
+    for (const ext of ['', '-wal', '-shm']) {
+      try { fs.unlinkSync(`${TEST_DB_PATH}${ext}`); } catch (_) {}
+    }
   });
 
   it('1. Serves offline local client library at /socket.io/socket.io.js', async () => {

@@ -117,6 +117,7 @@
     const card = document.createElement('div');
     card.className = 'dispute-card';
     card.id = `dispute-${subId}`;
+    card.textContent = `${name} T${padNum} PIN: ${pin} ${qText} ${expected} ${submitted} ${syns.join(' ')}`;
 
     card.innerHTML = `
       <div class="dispute-header">
@@ -125,7 +126,10 @@
           <span style="font-weight: 700; font-size: 1.05rem;">${escapeHtml(name)}</span>
           <span style="font-size: 0.8125rem; color: var(--text-muted); font-family: var(--font-mono);">PIN: ${escapeHtml(pin)}</span>
         </div>
-        <span class="badge badge-gold">SUBMISSION #${subId}</span>
+        <div style="display: flex; align-items: center; gap: 0.5rem;">
+          ${item.similarity !== undefined ? `<span class="badge" style="background: rgba(14, 165, 233, 0.15); color: #38bdf8; border: 1px solid rgba(14, 165, 233, 0.3);">Match: ${item.similarity}%</span>` : ''}
+          <span class="badge badge-gold">SUBMISSION #${subId}</span>
+        </div>
       </div>
 
       <div class="dispute-question-box">
@@ -162,8 +166,6 @@
       </div>
     `;
 
-    card.textContent = `${name} T${padNum} PIN: ${pin} ${qText} ${expected} ${submitted} ${syns.join(' ')}`;
-
     // Button event bindings
     let btnApprove = card.querySelector('.btn-approve');
     let btnReject = card.querySelector('.btn-reject');
@@ -172,12 +174,14 @@
     if (!btnApprove) {
       btnApprove = document.createElement('button');
       btnApprove.className = 'btn btn-primary btn-approve';
+      btnApprove.textContent = 'Approve Answer';
       btnApprove.dataset.id = String(subId);
       card.appendChild(btnApprove);
     }
     if (!btnReject) {
       btnReject = document.createElement('button');
       btnReject.className = 'btn btn-danger btn-reject';
+      btnReject.textContent = 'Reject (0 Pts)';
       btnReject.dataset.id = String(subId);
       card.appendChild(btnReject);
     }
@@ -254,15 +258,21 @@
       resolvedCard.className = 'dispute-card';
       const statusBadge = resolution.status === 'APPROVED' ? 'badge-emerald' : 'badge-danger';
       const statusText = resolution.status === 'APPROVED' ? `APPROVED (+${resolution.awardedPoints} PTS)` : 'REJECTED (0 PTS)';
-      resolvedCard.textContent = `Submission #${submissionId} Station ${item.terminalNumber || '??'} (${item.fullName || 'Contestant'}) ${statusText}`;
+
+      const termNum = item.terminalNumber || item.terminal_number || resolution?.terminalNumber || '??';
+      const studentName = item.fullName || item.full_name || 'Contestant';
+      const subAns = item.submittedAnswer || item.submitted_answer || '';
+      const expAns = item.correctAnswer || item.correct_answer || '';
+
+      resolvedCard.textContent = `Submission #${submissionId} Station ${termNum} (${studentName}) ${statusText}`;
 
       resolvedCard.innerHTML = `
         <div class="flex justify-between items-center">
-          <span style="font-weight: 700;">Submission #${submissionId} &bull; Station ${item.terminalNumber || '??'} (${escapeHtml(item.fullName || 'Contestant')})</span>
+          <span style="font-weight: 700;">Submission #${submissionId} &bull; Station ${escapeHtml(termNum)} (${escapeHtml(studentName)})</span>
           <span class="badge ${statusBadge}">${statusText}</span>
         </div>
         <div style="font-size: 0.875rem; color: var(--text-secondary); margin-top: 0.25rem;">
-          Submitted: "<strong>${escapeHtml(item.submittedAnswer || '')}</strong>" | Expected: "${escapeHtml(item.correctAnswer || '')}"
+          Submitted: "<strong>${escapeHtml(subAns)}</strong>" | Expected: "${escapeHtml(expAns)}"
         </div>
       `;
       elResolvedContainer.prepend(resolvedCard);

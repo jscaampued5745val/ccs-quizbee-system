@@ -68,12 +68,25 @@ function createDbInstance(dbPath) {
 }
 
 /**
+ * Resolve default DB path (env override; temp DB under `node --test`)
+ * @returns {string}
+ */
+function resolveDefaultDbPath() {
+  if (process.env.QUIZBEE_DB_PATH) return path.resolve(process.env.QUIZBEE_DB_PATH);
+  // Safety: when running under `node --test`, never touch the live tournament database
+  if (process.env.NODE_TEST_CONTEXT) {
+    return path.join(require('os').tmpdir(), `quizbee_test_default_${process.pid}.db`);
+  }
+  return path.resolve(__dirname, '../quizbee.db');
+}
+
+/**
  * Initialize SQLite database with WAL mode and schema tables
  * @param {string} [customPath] - Path to SQLite database file
  * @returns {Object}
  */
 function initDb(customPath) {
-  const dbPath = customPath || path.resolve(__dirname, '../quizbee.db');
+  const dbPath = customPath || resolveDefaultDbPath();
 
   // Ensure parent directory exists
   const dir = path.dirname(dbPath);
@@ -123,6 +136,7 @@ function initDb(customPath) {
       full_name TEXT NOT NULL,
       department_or_section TEXT DEFAULT 'BSIT',
       total_score INTEGER NOT NULL DEFAULT 0,
+      score_adjustment INTEGER NOT NULL DEFAULT 0,
       is_connected INTEGER NOT NULL DEFAULT 0 CHECK(is_connected IN (0, 1)),
       last_socket_id TEXT DEFAULT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -194,6 +208,33 @@ function initDb(customPath) {
     }
   } catch (_) {}
 
+  // Auto-migrate CONTESTANTS table to support score_adjustment
+  try {
+    const contestantCols = db.prepare("PRAGMA table_info(CONTESTANTS)").all().map(c => c.name);
+    if (!contestantCols.includes('score_adjustment')) {
+      db.exec("ALTER TABLE CONTESTANTS ADD COLUMN score_adjustment INTEGER NOT NULL DEFAULT 0;");
+    }
+  } catch (_) {}
+
+  // Trigger to keep score_adjustment in sync if total_score is updated directly
+  try {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_contestants_sync_score_adj
+      AFTER UPDATE OF total_score ON CONTESTANTS
+      FOR EACH ROW
+      WHEN NEW.score_adjustment = OLD.score_adjustment AND NEW.total_score != (
+        SELECT COALESCE(SUM(awarded_points), 0) FROM SUBMISSIONS WHERE contestant_id = NEW.id
+      ) + NEW.score_adjustment
+      BEGIN
+        UPDATE CONTESTANTS 
+        SET score_adjustment = NEW.total_score - (
+          SELECT COALESCE(SUM(awarded_points), 0) FROM SUBMISSIONS WHERE contestant_id = NEW.id
+        )
+        WHERE id = NEW.id;
+      END;
+    `);
+  } catch (_) {}
+
   prepareStatements();
   return db;
 }
@@ -263,7 +304,7 @@ function prepareStatements() {
         SELECT COALESCE(SUM(awarded_points), 0)
         FROM SUBMISSIONS
         WHERE contestant_id = ?
-      )
+      ) + COALESCE(score_adjustment, 0)
       WHERE id = ?
     `),
 
@@ -579,6 +620,37 @@ function getPendingRulings(questionId) {
 }
 
 /**
+ * Manually override a contestant's score and persist adjustment
+ * @param {string|number} pin
+ * @param {number} newScore
+ * @returns {Object}
+ */
+function overrideContestantScore(pin, newScore) {
+  const overrideTx = db.transaction(() => {
+    const contestant = stmts.getContestantByPin.get(String(pin));
+    if (!contestant) throw new Error(`Contestant with PIN ${pin} not found`);
+
+    const subSumRow = db.prepare(`
+      SELECT COALESCE(SUM(awarded_points), 0) AS subSum
+      FROM SUBMISSIONS
+      WHERE contestant_id = ?
+    `).get(contestant.id);
+    const subSum = subSumRow ? Number(subSumRow.subSum) : 0;
+    const adjustment = Number(newScore) - subSum;
+
+    db.prepare(`
+      UPDATE CONTESTANTS 
+      SET total_score = ?, score_adjustment = ?
+      WHERE id = ?
+    `).run(Number(newScore), adjustment, contestant.id);
+
+    return stmts.getContestantById.get(contestant.id);
+  });
+
+  return overrideTx();
+}
+
+/**
  * Get sorted leaderboard with tie-breaking calculations:
  * 1. Score DESC
  * 2. Earliest correct submission server timestamp ASC
@@ -596,11 +668,11 @@ function getLeaderboard(roundId) {
       c.full_name AS fullName,
       c.terminal_number AS terminalNumber,
       c.department_or_section AS department,
-      COALESCE(SUM(CASE WHEN s.is_correct = 1 ${filterClause} THEN s.awarded_points ELSE 0 END), 0) AS score,
+      COALESCE(SUM(CASE WHEN s.is_correct = 1 ${filterClause} THEN s.awarded_points ELSE 0 END), 0) + COALESCE(c.score_adjustment, 0) AS score,
       COALESCE(MIN(CASE WHEN s.is_correct = 1 ${filterClause} THEN s.server_time_ms ELSE NULL END), 0) AS lastSubmitTimeMs,
       RANK() OVER (
         ORDER BY 
-          COALESCE(SUM(CASE WHEN s.is_correct = 1 ${filterClause} THEN s.awarded_points ELSE 0 END), 0) DESC,
+          (COALESCE(SUM(CASE WHEN s.is_correct = 1 ${filterClause} THEN s.awarded_points ELSE 0 END), 0) + COALESCE(c.score_adjustment, 0)) DESC,
           CASE 
             WHEN MIN(CASE WHEN s.is_correct = 1 ${filterClause} THEN s.server_time_ms ELSE NULL END) IS NOT NULL 
             THEN MIN(CASE WHEN s.is_correct = 1 ${filterClause} THEN s.server_time_ms ELSE NULL END)
@@ -628,7 +700,7 @@ function resetTournamentScores() {
   const resetTx = db.transaction(() => {
     db.exec('DELETE FROM SUBMISSIONS;');
     db.exec('DELETE FROM CHEAT_LOGS;');
-    db.exec('UPDATE CONTESTANTS SET total_score = 0;');
+    db.exec('UPDATE CONTESTANTS SET total_score = 0, score_adjustment = 0;');
   });
   resetTx();
   return { success: true };
@@ -657,6 +729,7 @@ module.exports = {
   getSubmissionsForQuestion,
   saveSubmission,
   updateSubmissionRuling,
+  overrideContestantScore,
   logIncident,
   getIncidentLogs,
   getIncidentsForContestant: getIncidentLogs,
